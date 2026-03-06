@@ -224,6 +224,7 @@ describe("normalizeCronJobCreate", () => {
       name: "delivery",
       delivery: {
         mode: " ANNOUNCE ",
+        format: " FULL ",
         channel: " TeLeGrAm ",
         to: " 7200373102 ",
       },
@@ -231,6 +232,7 @@ describe("normalizeCronJobCreate", () => {
 
     const delivery = normalized.delivery as Record<string, unknown>;
     expectAnnounceDeliveryTarget(delivery, { channel: "telegram", to: "7200373102" });
+    expect(delivery.format).toBe("full");
   });
 
   it("normalizes delivery accountId and strips blanks", () => {
@@ -413,6 +415,19 @@ describe("normalizeCronJobCreate", () => {
     const delivery = normalized.delivery as Record<string, unknown>;
     expect(delivery.mode).toBeUndefined();
     expect(delivery.to).toBe("123");
+  });
+
+  it("strips invalid delivery format", () => {
+    const normalized = normalizeCronJobCreate({
+      name: "delivery format",
+      schedule: { kind: "cron", expr: "* * * * *" },
+      payload: { kind: "agentTurn", message: "hello" },
+      delivery: { mode: "announce", format: "verbose" },
+    }) as unknown as Record<string, unknown>;
+
+    const delivery = normalized.delivery as Record<string, unknown>;
+    expect(delivery.mode).toBe("announce");
+    expect(delivery.format).toBeUndefined();
   });
 });
 

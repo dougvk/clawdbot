@@ -8,10 +8,17 @@ import { resolveAgentOutboundIdentity } from "../infra/outbound/identity.js";
 import { buildOutboundSessionContext } from "../infra/outbound/session-context.js";
 import { getChildLogger } from "../logging.js";
 import { resolveDeliveryTarget } from "./isolated-agent/delivery-target.js";
-import type { CronDelivery, CronDeliveryMode, CronJob, CronMessageChannel } from "./types.js";
+import type {
+  CronDelivery,
+  CronDeliveryFormat,
+  CronDeliveryMode,
+  CronJob,
+  CronMessageChannel,
+} from "./types.js";
 
 export type CronDeliveryPlan = {
   mode: CronDeliveryMode;
+  format: CronDeliveryFormat;
   channel?: CronMessageChannel;
   to?: string;
   /** Explicit channel account id from the delivery config, if set. */
@@ -64,6 +71,11 @@ export function resolveCronDeliveryPlan(job: CronJob): CronDeliveryPlan {
             ? "announce"
             : undefined;
 
+  const rawFormat = hasDelivery ? (delivery as { format?: unknown }).format : undefined;
+  const normalizedFormat =
+    typeof rawFormat === "string" ? rawFormat.trim().toLowerCase() : rawFormat;
+  const format = normalizedFormat === "full" ? "full" : "summary";
+
   const payloadChannel = normalizeChannel(payload?.channel);
   const payloadTo = normalizeTo(payload?.to);
   const deliveryChannel = normalizeChannel(
@@ -79,6 +91,7 @@ export function resolveCronDeliveryPlan(job: CronJob): CronDeliveryPlan {
     const resolvedMode = mode ?? "announce";
     return {
       mode: resolvedMode,
+      format,
       channel: resolvedMode === "announce" ? channel : undefined,
       to,
       accountId: deliveryAccountId,
@@ -94,6 +107,7 @@ export function resolveCronDeliveryPlan(job: CronJob): CronDeliveryPlan {
 
   return {
     mode: requested ? "announce" : "none",
+    format: "summary",
     channel,
     to,
     source: "payload",

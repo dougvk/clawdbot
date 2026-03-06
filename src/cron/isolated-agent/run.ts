@@ -56,7 +56,7 @@ import {
   isExternalHookSession,
 } from "../../security/external-content.js";
 import { resolveCronDeliveryPlan } from "../delivery.js";
-import type { CronJob, CronRunOutcome, CronRunTelemetry } from "../types.js";
+import type { CronDeliveryFormat, CronJob, CronRunOutcome, CronRunTelemetry } from "../types.js";
 import {
   dispatchCronDelivery,
   matchesMessagingToolDeliveryTarget,
@@ -192,11 +192,16 @@ async function resolveCronDeliveryContext(params: {
 function appendCronDeliveryInstruction(params: {
   commandBody: string;
   deliveryRequested: boolean;
+  deliveryFormat?: CronDeliveryFormat;
 }) {
   if (!params.deliveryRequested) {
     return params.commandBody;
   }
-  return `${params.commandBody}\n\nReturn your summary as plain text; it will be delivered automatically. If the task explicitly calls for messaging a specific external recipient, note who/where it should go instead of sending it yourself.`.trim();
+  const deliveryInstruction =
+    params.deliveryFormat === "full"
+      ? "Return your full final output as plain text; it will be delivered automatically. If the task explicitly calls for messaging a specific external recipient, note who/where it should go instead of sending it yourself."
+      : "Return your summary as plain text; it will be delivered automatically. If the task explicitly calls for messaging a specific external recipient, note who/where it should go instead of sending it yourself.";
+  return `${params.commandBody}\n\n${deliveryInstruction}`.trim();
 }
 
 export async function runCronIsolatedAgentTurn(params: {
@@ -432,12 +437,14 @@ export async function runCronIsolatedAgentTurn(params: {
   });
 
   const agentPayload = params.job.payload.kind === "agentTurn" ? params.job.payload : null;
-  const { deliveryRequested, resolvedDelivery, toolPolicy } = await resolveCronDeliveryContext({
-    cfg: cfgWithAgentDefaults,
-    job: params.job,
-    agentId,
-    deliveryContract,
-  });
+  const { deliveryPlan, deliveryRequested, resolvedDelivery, toolPolicy } =
+    await resolveCronDeliveryContext({
+      cfg: cfgWithAgentDefaults,
+      job: params.job,
+      agentId,
+      deliveryContract,
+    });
+  const deliveryFormat = deliveryPlan.format;
 
   const { formattedTime, timeLine } = resolveCronStyleNow(params.cfg, now);
   const base = `[cron:${params.job.id} ${params.job.name}] ${params.message}`.trim();
@@ -478,7 +485,11 @@ export async function runCronIsolatedAgentTurn(params: {
     // Internal/trusted source - use original format
     commandBody = `${base}\n${timeLine}`.trim();
   }
-  commandBody = appendCronDeliveryInstruction({ commandBody, deliveryRequested });
+  commandBody = appendCronDeliveryInstruction({
+    commandBody,
+    deliveryRequested,
+    deliveryFormat,
+  });
 
   const existingSkillsSnapshot = cronSession.sessionEntry.skillsSnapshot;
   const skillsSnapshot = resolveCronSkillsSnapshot({
@@ -849,6 +860,7 @@ export async function runCronIsolatedAgentTurn(params: {
     timeoutMs,
     resolvedDelivery,
     deliveryRequested,
+    deliveryFormat,
     skipHeartbeatDelivery,
     skipMessagingToolDelivery,
     deliveryBestEffort,
