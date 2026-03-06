@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import { resolveStateDir } from "../config/paths.js";
 import { type ExecHost, loadExecApprovals, maxAsk, minSecurity } from "../infra/exec-approvals.js";
 import { resolveExecSafeBinRuntimePolicy } from "../infra/exec-safe-bin-runtime-policy.js";
 import {
@@ -146,6 +148,49 @@ async function validateScriptFileForShellBleed(params: {
       );
     }
   }
+}
+
+function isQmdCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const withoutAssignments = trimmed.replace(
+    /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)*/,
+    "",
+  );
+  const tokenMatch = withoutAssignments.match(/^(?:"([^"]+)"|'([^']+)'|([^\s]+))/);
+  const token = (tokenMatch?.[1] ?? tokenMatch?.[2] ?? tokenMatch?.[3] ?? "").trim();
+  if (!token) {
+    return false;
+  }
+  const bin = path.basename(token).toLowerCase();
+  return bin === "qmd" || bin === "qmd.exe" || bin === "qmd.cmd" || bin === "qmd.bat";
+}
+
+function resolveScopedQmdEnv(params: {
+  command: string;
+  agentId?: string;
+  paramsEnv?: Record<string, string>;
+}): Record<string, string> | null {
+  if (!params.agentId || !isQmdCommand(params.command)) {
+    return null;
+  }
+  const stateDir = resolveStateDir(process.env, os.homedir);
+  const xdgConfigHome = path.join(stateDir, "agents", params.agentId, "qmd", "xdg-config");
+  const xdgCacheHome = path.join(stateDir, "agents", params.agentId, "qmd", "xdg-cache");
+  const qmdConfigDir = path.join(xdgConfigHome, "qmd");
+  const scopedEnv: Record<string, string> = {};
+  if (!params.paramsEnv?.QMD_CONFIG_DIR) {
+    scopedEnv.QMD_CONFIG_DIR = qmdConfigDir;
+  }
+  if (!params.paramsEnv?.XDG_CONFIG_HOME) {
+    scopedEnv.XDG_CONFIG_HOME = xdgConfigHome;
+  }
+  if (!params.paramsEnv?.XDG_CACHE_HOME) {
+    scopedEnv.XDG_CACHE_HOME = xdgCacheHome;
+  }
+  return Object.keys(scopedEnv).length > 0 ? scopedEnv : null;
 }
 
 export function createExecTool(
@@ -397,6 +442,18 @@ export function createExecTool(
         );
       } else {
         applyPathPrepend(env, defaultPathPrepend);
+      }
+
+      // Keep direct `qmd ...` commands scoped to the current agent's isolated QMD state.
+      if (!sandbox && host !== "node") {
+        const scopedQmdEnv = resolveScopedQmdEnv({
+          command: params.command,
+          agentId,
+          paramsEnv: params.env,
+        });
+        if (scopedQmdEnv) {
+          Object.assign(env, scopedQmdEnv);
+        }
       }
 
       if (host === "node") {
