@@ -9,6 +9,11 @@ export type BrowserProfileConfig = {
   attachOnly?: boolean;
   /** Profile color (hex). Auto-assigned at creation. */
   color: string;
+  /**
+   * Override launch mode for this profile.
+   * Falls back to browser.headless when unset.
+   */
+  headless?: boolean;
 };
 export type BrowserSnapshotDefaults = {
   /** Default snapshot mode (applies when mode is not provided). */

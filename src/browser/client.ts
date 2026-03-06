@@ -106,6 +106,43 @@ function withBaseUrl(baseUrl: string | undefined, path: string): string {
   return `${trimmed.replace(/\/$/, "")}${path}`;
 }
 
+const BROWSER_START_TIMEOUT_MS = 45_000;
+const BROWSER_OPEN_TIMEOUT_MS = 30_000;
+const BROWSER_START_RETRY_DELAY_MS = 2_000;
+
+function getErrorMessage(err: unknown): string {
+  if (typeof err === "string") {
+    return err;
+  }
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return "";
+}
+
+function isTransientBrowserControlError(err: unknown): boolean {
+  const msg = getErrorMessage(err);
+  const lower = msg.toLowerCase();
+  return (
+    msg.includes("Can't reach the OpenClaw browser control service") ||
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("aborted")
+  );
+}
+
+async function retryOnceForBrowserStartup<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    if (!isTransientBrowserControlError(error)) {
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, BROWSER_START_RETRY_DELAY_MS));
+    return await fn();
+  }
+}
+
 export async function browserStatus(
   baseUrl?: string,
   opts?: { profile?: string },
@@ -128,9 +165,11 @@ export async function browserProfiles(baseUrl?: string): Promise<ProfileStatus[]
 
 export async function browserStart(baseUrl?: string, opts?: { profile?: string }): Promise<void> {
   const q = buildProfileQuery(opts?.profile);
-  await fetchBrowserJson(withBaseUrl(baseUrl, `/start${q}`), {
-    method: "POST",
-    timeoutMs: 15000,
+  await retryOnceForBrowserStartup(async () => {
+    await fetchBrowserJson(withBaseUrl(baseUrl, `/start${q}`), {
+      method: "POST",
+      timeoutMs: BROWSER_START_TIMEOUT_MS,
+    });
   });
 }
 
@@ -212,12 +251,16 @@ export async function browserDeleteProfile(
 
 export async function browserTabs(
   baseUrl?: string,
-  opts?: { profile?: string },
+  opts?: { profile?: string; timeoutMs?: number },
 ): Promise<BrowserTab[]> {
   const q = buildProfileQuery(opts?.profile);
+  const timeoutMs =
+    typeof opts?.timeoutMs === "number" && Number.isFinite(opts.timeoutMs)
+      ? Math.max(1000, Math.min(120_000, Math.floor(opts.timeoutMs)))
+      : 3000;
   const res = await fetchBrowserJson<{ running: boolean; tabs: BrowserTab[] }>(
     withBaseUrl(baseUrl, `/tabs${q}`),
-    { timeoutMs: 3000 },
+    { timeoutMs },
   );
   return res.tabs ?? [];
 }
@@ -232,7 +275,7 @@ export async function browserOpenTab(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url }),
-    timeoutMs: 15000,
+    timeoutMs: BROWSER_OPEN_TIMEOUT_MS,
   });
 }
 
@@ -298,6 +341,7 @@ export async function browserSnapshot(
     labels?: boolean;
     mode?: "efficient";
     profile?: string;
+    timeoutMs?: number;
   },
 ): Promise<SnapshotResult> {
   const q = new URLSearchParams();
@@ -340,8 +384,12 @@ export async function browserSnapshot(
   if (opts.profile) {
     q.set("profile", opts.profile);
   }
+  const timeoutMs =
+    typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs)
+      ? Math.max(1000, Math.min(120_000, Math.floor(opts.timeoutMs)))
+      : 20000;
   return await fetchBrowserJson<SnapshotResult>(withBaseUrl(baseUrl, `/snapshot?${q.toString()}`), {
-    timeoutMs: 20000,
+    timeoutMs,
   });
 }
 

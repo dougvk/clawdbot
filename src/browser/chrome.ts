@@ -33,6 +33,7 @@ import {
   DEFAULT_OPENCLAW_BROWSER_COLOR,
   DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME,
 } from "./constants.js";
+import { reapStaleCrashpadHandlersForProfile } from "./crashpad-gc.js";
 
 const log = createSubsystemLogger("browser").child("chrome");
 
@@ -65,6 +66,9 @@ export type RunningChrome = {
   startedAt: number;
   proc: ChildProcessWithoutNullStreams;
 };
+
+type LaunchArgsConfig = Pick<ResolvedBrowserConfig, "noSandbox" | "extraArgs">;
+type LaunchArgsProfile = Pick<ResolvedBrowserProfile, "cdpPort" | "headless">;
 
 function resolveBrowserExecutable(resolved: ResolvedBrowserConfig): BrowserExecutable | null {
   return resolveBrowserExecutableForPlatform(resolved, process.platform);
@@ -235,6 +239,81 @@ export async function isChromeCdpReady(
   return await canRunCdpHealthCommand(wsUrl, handshakeTimeoutMs);
 }
 
+export function buildOpenClawChromeLaunchArgs(params: {
+  config: LaunchArgsConfig;
+  profile: LaunchArgsProfile;
+  userDataDir: string;
+  platform?: NodeJS.Platform;
+  display?: string | undefined;
+  forceDisableDevShmUsage?: string | undefined;
+}) {
+  const {
+    config,
+    profile,
+    userDataDir,
+    platform = process.platform,
+    display = process.env.DISPLAY,
+    forceDisableDevShmUsage = process.env.OPENCLAW_BROWSER_DISABLE_DEV_SHM_USAGE,
+  } = params;
+  const args: string[] = [
+    `--remote-debugging-port=${profile.cdpPort}`,
+    `--user-data-dir=${userDataDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-sync",
+    "--disable-background-networking",
+    "--disable-component-update",
+    // Keep renderers running even when the window is occluded/backgrounded.
+    // Without this, Chromium can stop producing compositor frames and CDP
+    // Page.captureScreenshot may hang indefinitely on some Linux setups.
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-features=Translate,MediaRouter",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    "--password-store=basic",
+  ];
+
+  if (profile.headless) {
+    // Best-effort; older Chromes may ignore.
+    args.push("--headless=new");
+    args.push("--disable-gpu");
+  }
+  if (config.noSandbox) {
+    args.push("--no-sandbox");
+    args.push("--disable-setuid-sandbox");
+  }
+  if (platform === "linux") {
+    // Some Linux Chromium builds (observed on Arch Chromium 144) hard-crash
+    // with --disable-dev-shm-usage in headless mode. Keep this opt-in only.
+    if (forceDisableDevShmUsage === "1" || forceDisableDevShmUsage?.toLowerCase() === "true") {
+      args.push("--disable-dev-shm-usage");
+    }
+
+    // Workaround: On some Linux systems Chromium is launched with Ozone/Wayland
+    // (often via distro wrappers that append --ozone-platform=wayland). We've
+    // observed CDP Page.captureScreenshot hanging indefinitely in that mode.
+    // If X11 is available, prefer it for the managed OpenClaw browser.
+    if (!profile.headless && display?.trim()) {
+      args.push("--ozone-platform=x11");
+      args.push("--ozone-platform-hint=x11");
+    }
+  }
+
+  // Stealth: hide navigator.webdriver from automation detection (#80)
+  args.push("--disable-blink-features=AutomationControlled");
+
+  // Append user-configured extra arguments (e.g., stealth flags, window size)
+  if (config.extraArgs.length > 0) {
+    args.push(...config.extraArgs);
+  }
+
+  // Always open a blank tab to ensure a target exists.
+  args.push("about:blank");
+
+  return args;
+}
+
 export async function launchOpenClawChrome(
   resolved: ResolvedBrowserConfig,
   profile: ResolvedBrowserProfile,
@@ -253,6 +332,14 @@ export async function launchOpenClawChrome(
 
   const userDataDir = resolveOpenClawUserDataDir(profile.name);
   fs.mkdirSync(userDataDir, { recursive: true });
+  await reapStaleCrashpadHandlersForProfile({
+    userDataDir,
+    logger: log,
+  }).catch((err) => {
+    log.warn(`openclaw browser crashpad preflight failed: ${String(err)}`);
+  });
+  const isolatedXdgConfigHome = path.join(userDataDir, "xdg-config");
+  fs.mkdirSync(isolatedXdgConfigHome, { recursive: true });
 
   const needsDecorate = !isProfileDecorated(
     userDataDir,
@@ -262,40 +349,11 @@ export async function launchOpenClawChrome(
 
   // First launch to create preference files if missing, then decorate and relaunch.
   const spawnOnce = () => {
-    const args: string[] = [
-      `--remote-debugging-port=${profile.cdpPort}`,
-      `--user-data-dir=${userDataDir}`,
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-sync",
-      "--disable-background-networking",
-      "--disable-component-update",
-      "--disable-features=Translate,MediaRouter",
-      "--disable-session-crashed-bubble",
-      "--hide-crash-restore-bubble",
-      "--password-store=basic",
-    ];
-
-    if (resolved.headless) {
-      // Best-effort; older Chromes may ignore.
-      args.push("--headless=new");
-      args.push("--disable-gpu");
-    }
-    if (resolved.noSandbox) {
-      args.push("--no-sandbox");
-      args.push("--disable-setuid-sandbox");
-    }
-    if (process.platform === "linux") {
-      args.push("--disable-dev-shm-usage");
-    }
-
-    // Append user-configured extra arguments (e.g., stealth flags, window size)
-    if (resolved.extraArgs.length > 0) {
-      args.push(...resolved.extraArgs);
-    }
-
-    // Always open a blank tab to ensure a target exists.
-    args.push("about:blank");
+    const args = buildOpenClawChromeLaunchArgs({
+      config: resolved,
+      profile,
+      userDataDir,
+    });
 
     return spawn(exe.path, args, {
       stdio: "pipe",
@@ -303,6 +361,9 @@ export async function launchOpenClawChrome(
         ...process.env,
         // Reduce accidental sharing with the user's env.
         HOME: os.homedir(),
+        // Prevent Chromium launcher wrappers from loading the user's
+        // ~/.config/chromium-flags.conf into managed OpenClaw sessions.
+        XDG_CONFIG_HOME: isolatedXdgConfigHome,
       },
     });
   };
@@ -390,6 +451,12 @@ export async function launchOpenClawChrome(
     } catch {
       // ignore
     }
+    await reapStaleCrashpadHandlersForProfile({
+      userDataDir,
+      logger: log,
+    }).catch((err) => {
+      log.warn(`openclaw browser crashpad cleanup failed after launch error: ${String(err)}`);
+    });
     throw new Error(
       `Failed to start Chrome CDP on port ${profile.cdpPort} for profile "${profile.name}".${sandboxHint}${stderrHint}`,
     );
@@ -419,7 +486,16 @@ export async function stopOpenClawChrome(
   timeoutMs = CHROME_STOP_TIMEOUT_MS,
 ) {
   const proc = running.proc;
+  const reapCrashpad = async () => {
+    await reapStaleCrashpadHandlersForProfile({
+      userDataDir: running.userDataDir,
+      logger: log,
+    }).catch((err) => {
+      log.warn(`openclaw browser crashpad cleanup failed on stop: ${String(err)}`);
+    });
+  };
   if (proc.killed) {
+    await reapCrashpad();
     return;
   }
   try {
@@ -434,6 +510,7 @@ export async function stopOpenClawChrome(
       break;
     }
     if (!(await isChromeReachable(cdpUrlForPort(running.cdpPort), CHROME_STOP_PROBE_TIMEOUT_MS))) {
+      await reapCrashpad();
       return;
     }
     await new Promise((r) => setTimeout(r, 100));
@@ -444,4 +521,5 @@ export async function stopOpenClawChrome(
   } catch {
     // ignore
   }
+  await reapCrashpad();
 }

@@ -86,6 +86,16 @@ const LEGACY_BROWSER_ACT_REQUEST_KEYS = [
 function readActRequestParam(params: Record<string, unknown>) {
   const requestParam = params.request;
   if (requestParam && typeof requestParam === "object") {
+    if (
+      !Object.hasOwn(requestParam, "timeoutMs") &&
+      typeof params.timeoutMs === "number" &&
+      Number.isFinite(params.timeoutMs)
+    ) {
+      return {
+        ...(requestParam as Record<string, unknown>),
+        timeoutMs: params.timeoutMs,
+      } as Parameters<typeof browserAct>[1];
+    }
     return requestParam as Parameters<typeof browserAct>[1];
   }
 
@@ -443,7 +453,7 @@ export function createBrowserTool(opts?: {
           }
           return jsonResult({ profiles: await browserProfiles(baseUrl) });
         case "tabs":
-          return await executeTabsAction({ baseUrl, profile, proxyRequest });
+          return await executeTabsAction({ input: params, baseUrl, profile, proxyRequest });
         case "open": {
           const targetUrl = readTargetUrlParam(params);
           if (proxyRequest) {
@@ -523,17 +533,23 @@ export function createBrowserTool(opts?: {
           const ref = readStringParam(params, "ref");
           const element = readStringParam(params, "element");
           const type = params.type === "jpeg" ? "jpeg" : "png";
+          const timeoutMs =
+            typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
+              ? Math.max(1000, Math.min(120_000, Math.floor(params.timeoutMs)))
+              : undefined;
           const result = proxyRequest
             ? ((await proxyRequest({
                 method: "POST",
                 path: "/screenshot",
                 profile,
+                timeoutMs,
                 body: {
                   targetId,
                   fullPage,
                   ref,
                   element,
                   type,
+                  timeoutMs,
                 },
               })) as Awaited<ReturnType<typeof browserScreenshotAction>>)
             : await browserScreenshotAction(baseUrl, {
@@ -543,6 +559,7 @@ export function createBrowserTool(opts?: {
                 element,
                 type,
                 profile,
+                timeoutMs,
               });
           return await imageResultFromFile({
             label: "browser:screenshot",
@@ -553,14 +570,20 @@ export function createBrowserTool(opts?: {
         case "navigate": {
           const targetUrl = readTargetUrlParam(params);
           const targetId = readStringParam(params, "targetId");
+          const timeoutMs =
+            typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
+              ? Math.max(1000, Math.min(120_000, Math.floor(params.timeoutMs)))
+              : undefined;
           if (proxyRequest) {
             const result = await proxyRequest({
               method: "POST",
               path: "/navigate",
               profile,
+              timeoutMs,
               body: {
                 url: targetUrl,
                 targetId,
+                timeoutMs,
               },
             });
             return jsonResult(result);
@@ -569,6 +592,7 @@ export function createBrowserTool(opts?: {
             await browserNavigate(baseUrl, {
               url: targetUrl,
               targetId,
+              timeoutMs,
               profile,
             }),
           );

@@ -120,12 +120,6 @@ const configMocks = vi.hoisted(() => ({
 }));
 vi.mock("../../config/config.js", () => configMocks);
 
-const sessionTabRegistryMocks = vi.hoisted(() => ({
-  trackSessionBrowserTab: vi.fn(),
-  untrackSessionBrowserTab: vi.fn(),
-}));
-vi.mock("../../browser/session-tab-registry.js", () => sessionTabRegistryMocks);
-
 const toolCommonMocks = vi.hoisted(() => ({
   imageResultFromFile: vi.fn(),
 }));
@@ -244,6 +238,173 @@ describe("browser tool snapshot maxChars", () => {
     await tool.execute?.("call-1", { action: "profiles" });
 
     expect(browserClientMocks.browserProfiles).toHaveBeenCalledWith(undefined);
+  });
+
+  it("passes timeoutMs through to navigate", async () => {
+    const tool = createBrowserTool();
+    await tool.execute?.(null, {
+      action: "navigate",
+      targetUrl: "https://example.com",
+      timeoutMs: 3000,
+    });
+
+    expect(browserActionsMocks.browserNavigate).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({
+        url: "https://example.com",
+        timeoutMs: 3000,
+      }),
+    );
+  });
+
+  it("passes timeoutMs through to screenshot", async () => {
+    const tool = createBrowserTool();
+    await tool.execute?.(null, {
+      action: "screenshot",
+      targetId: "t1",
+      timeoutMs: 3000,
+    });
+
+    expect(browserActionsMocks.browserScreenshotAction).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({
+        targetId: "t1",
+        timeoutMs: 3000,
+      }),
+    );
+  });
+
+  it("passes timeoutMs through to act", async () => {
+    const tool = createBrowserTool();
+    await tool.execute?.(null, {
+      action: "act",
+      timeoutMs: 3000,
+      request: {
+        kind: "click",
+        targetId: "t1",
+        ref: "e12",
+      },
+    });
+
+    expect(browserActionsMocks.browserAct).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({
+        kind: "click",
+        targetId: "t1",
+        ref: "e12",
+        timeoutMs: 3000,
+      }),
+      expect.objectContaining({
+        timeoutMs: 3000,
+      }),
+    );
+  });
+
+  it("returns stale-element guidance when act refs are no longer valid", async () => {
+    browserActionsMocks.browserAct.mockRejectedValueOnce(
+      new Error('Element "e12" not found or not visible'),
+    );
+    const tool = createBrowserTool();
+
+    await expect(
+      tool.execute?.(null, {
+        action: "act",
+        request: {
+          kind: "click",
+          targetId: "t1",
+          ref: "e12",
+        },
+      }),
+    ).rejects.toThrow(
+      'Browser element reference is stale. Run action="snapshot" again on the same tab, then retry using a fresh ref/element id.',
+    );
+  });
+
+  it("retries snapshot once with a higher timeout after a low-timeout failure", async () => {
+    browserClientMocks.browserSnapshot
+      .mockRejectedValueOnce(new Error("Browser request timed out after 3000ms."))
+      .mockResolvedValueOnce({
+        ok: true,
+        format: "ai",
+        targetId: "t1",
+        url: "https://example.com",
+        snapshot: "ok",
+      });
+    const tool = createBrowserTool();
+
+    await tool.execute?.("call-1", {
+      action: "snapshot",
+      snapshotFormat: "ai",
+      timeoutMs: 3000,
+    });
+
+    expect(browserClientMocks.browserSnapshot).toHaveBeenCalledTimes(2);
+    expect(browserClientMocks.browserSnapshot.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ timeoutMs: 3000 }),
+    );
+    expect(browserClientMocks.browserSnapshot.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({ timeoutMs: 10_000 }),
+    );
+  });
+
+  it("does not retry snapshot when timeout budget is already high", async () => {
+    browserClientMocks.browserSnapshot.mockRejectedValueOnce(
+      new Error("Browser request timed out after 7000ms."),
+    );
+    const tool = createBrowserTool();
+
+    await expect(
+      tool.execute?.("call-1", {
+        action: "snapshot",
+        snapshotFormat: "ai",
+        timeoutMs: 7000,
+      }),
+    ).rejects.toThrow("timed out after 7000ms");
+
+    expect(browserClientMocks.browserSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries tabs once after a low-timeout failure", async () => {
+    browserClientMocks.browserTabs
+      .mockRejectedValueOnce(new Error("Browser request timed out after 3000ms."))
+      .mockResolvedValueOnce([
+        {
+          targetId: "tab-1",
+          title: "Example",
+          url: "https://example.com",
+          wsUrl: "ws://127.0.0.1:18800/devtools/page/tab-1",
+          type: "page",
+        },
+      ]);
+    const tool = createBrowserTool();
+
+    await tool.execute?.("call-1", { action: "tabs" });
+
+    expect(browserClientMocks.browserTabs).toHaveBeenCalledTimes(2);
+    expect(browserClientMocks.browserTabs.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ profile: "openclaw", timeoutMs: undefined }),
+    );
+    expect(browserClientMocks.browserTabs.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({ profile: "openclaw", timeoutMs: 10_000 }),
+    );
+  });
+
+  it("retries console once after a low-timeout failure", async () => {
+    browserActionsMocks.browserConsoleMessages
+      .mockRejectedValueOnce(new Error("Browser request timed out after 3000ms."))
+      .mockResolvedValueOnce({
+        ok: true,
+        targetId: "t1",
+        messages: [],
+      });
+    const tool = createBrowserTool();
+
+    await tool.execute?.("call-1", { action: "console" });
+
+    expect(browserActionsMocks.browserConsoleMessages).toHaveBeenCalledTimes(2);
+    expect(browserActionsMocks.browserConsoleMessages.mock.calls[1]?.[1]).toEqual(
+      expect.objectContaining({ timeoutMs: 10_000 }),
+    );
   });
 
   it("passes refs mode through to browser snapshot", async () => {
@@ -433,7 +594,7 @@ describe("browser tool snapshot maxChars", () => {
 
     expect(browserClientMocks.browserStatus).toHaveBeenCalledWith(
       "http://127.0.0.1:9999",
-      expect.objectContaining({ profile: undefined }),
+      expect.objectContaining({ profile: "openclaw" }),
     );
     expect(gatewayMocks.callGatewayTool).not.toHaveBeenCalled();
   });
@@ -456,6 +617,66 @@ describe("browser tool snapshot maxChars", () => {
     );
     expect(gatewayMocks.callGatewayTool).not.toHaveBeenCalled();
   });
+
+  it("defaults to openclaw profile when profile is omitted", async () => {
+    const tool = createBrowserTool();
+    await tool.execute?.("call-1", { action: "status" });
+
+    expect(browserClientMocks.browserStatus).toHaveBeenCalledWith(
+      undefined,
+      expect.objectContaining({ profile: "openclaw" }),
+    );
+  });
+
+  it("auto-selects a headless profile when headless=true", async () => {
+    browserClientMocks.browserProfiles.mockResolvedValueOnce([
+      {
+        name: "openclaw",
+        cdpPort: 18800,
+        cdpUrl: "http://127.0.0.1:18800",
+        color: "#FF4500",
+        running: false,
+        tabCount: 0,
+        isDefault: true,
+        isRemote: false,
+      },
+      {
+        name: "work",
+        cdpPort: 18801,
+        cdpUrl: "http://127.0.0.1:18801",
+        color: "#00AA00",
+        running: false,
+        tabCount: 0,
+        isDefault: false,
+        isRemote: false,
+      },
+    ]);
+    browserClientMocks.browserStatus
+      .mockResolvedValueOnce({
+        ok: true,
+        running: true,
+        pid: 1,
+        cdpPort: 18792,
+        cdpUrl: "http://127.0.0.1:18792",
+        headless: true,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        running: true,
+        pid: 1,
+        cdpPort: 18792,
+        cdpUrl: "http://127.0.0.1:18792",
+        headless: true,
+      });
+
+    const tool = createBrowserTool();
+    await tool.execute?.("call-1", { action: "status", headless: true });
+
+    expect(browserClientMocks.browserStatus).toHaveBeenLastCalledWith(
+      undefined,
+      expect.objectContaining({ profile: "work" }),
+    );
+  });
 });
 
 describe("browser tool url alias support", () => {
@@ -468,25 +689,8 @@ describe("browser tool url alias support", () => {
     expect(browserClientMocks.browserOpenTab).toHaveBeenCalledWith(
       undefined,
       "https://example.com",
-      expect.objectContaining({ profile: undefined }),
+      expect.objectContaining({ profile: "openclaw" }),
     );
-  });
-
-  it("tracks opened tabs when session context is available", async () => {
-    browserClientMocks.browserOpenTab.mockResolvedValueOnce({
-      targetId: "tab-123",
-      title: "Example",
-      url: "https://example.com",
-    });
-    const tool = createBrowserTool({ agentSessionKey: "agent:main:main" });
-    await tool.execute?.("call-1", { action: "open", url: "https://example.com" });
-
-    expect(sessionTabRegistryMocks.trackSessionBrowserTab).toHaveBeenCalledWith({
-      sessionKey: "agent:main:main",
-      targetId: "tab-123",
-      baseUrl: undefined,
-      profile: undefined,
-    });
   });
 
   it("accepts url alias for navigate", async () => {
@@ -502,7 +706,7 @@ describe("browser tool url alias support", () => {
       expect.objectContaining({
         url: "https://example.com",
         targetId: "tab-1",
-        profile: undefined,
+        profile: "openclaw",
       }),
     );
   });
@@ -513,26 +717,6 @@ describe("browser tool url alias support", () => {
     await expect(tool.execute?.("call-1", { action: "open" })).rejects.toThrow(
       "targetUrl required",
     );
-  });
-
-  it("untracks explicit tab close for tracked sessions", async () => {
-    const tool = createBrowserTool({ agentSessionKey: "agent:main:main" });
-    await tool.execute?.("call-1", {
-      action: "close",
-      targetId: "tab-xyz",
-    });
-
-    expect(browserClientMocks.browserCloseTab).toHaveBeenCalledWith(
-      undefined,
-      "tab-xyz",
-      expect.objectContaining({ profile: undefined }),
-    );
-    expect(sessionTabRegistryMocks.untrackSessionBrowserTab).toHaveBeenCalledWith({
-      sessionKey: "agent:main:main",
-      targetId: "tab-xyz",
-      baseUrl: undefined,
-      profile: undefined,
-    });
   });
 });
 
@@ -559,7 +743,7 @@ describe("browser tool act compatibility", () => {
         targetId: "tab-1",
         timeoutMs: 5000,
       }),
-      expect.objectContaining({ profile: undefined }),
+      expect.objectContaining({ profile: "openclaw", timeoutMs: 5000 }),
     );
   });
 
@@ -583,7 +767,7 @@ describe("browser tool act compatibility", () => {
         key: "Enter",
         targetId: "tab-2",
       },
-      expect.objectContaining({ profile: undefined }),
+      expect.objectContaining({ profile: "openclaw" }),
     );
   });
 });

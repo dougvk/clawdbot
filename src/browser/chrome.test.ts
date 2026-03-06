@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { WebSocketServer } from "ws";
 import {
+  buildOpenClawChromeLaunchArgs,
   decorateOpenClawProfile,
   ensureProfileCleanExit,
   findChromeExecutableMac,
@@ -385,5 +386,33 @@ describe("browser chrome helpers", () => {
     await stopChromeWithProc(proc, 1);
     expect(proc.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
     expect(proc.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+  });
+
+  it("includes headless flags when the selected profile is headless", () => {
+    const args = buildOpenClawChromeLaunchArgs({
+      config: { noSandbox: false, extraArgs: [] },
+      profile: { cdpPort: 18800, headless: true },
+      userDataDir: "/tmp/openclaw-profile",
+      platform: "linux",
+      display: ":1",
+    });
+
+    expect(args).toContain("--headless=new");
+    expect(args).toContain("--disable-gpu");
+    expect(args).not.toContain("--ozone-platform=x11");
+  });
+
+  it("uses headful flags on linux when the selected profile disables headless", () => {
+    const args = buildOpenClawChromeLaunchArgs({
+      config: { noSandbox: false, extraArgs: [] },
+      profile: { cdpPort: 18800, headless: false },
+      userDataDir: "/tmp/openclaw-profile",
+      platform: "linux",
+      display: ":1",
+    });
+
+    expect(args).not.toContain("--headless=new");
+    expect(args).toContain("--ozone-platform=x11");
+    expect(args).toContain("--ozone-platform-hint=x11");
   });
 });

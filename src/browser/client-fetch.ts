@@ -9,12 +9,23 @@ import {
 } from "./control-service.js";
 import { createBrowserRouteDispatcher } from "./routes/dispatcher.js";
 
-// Application-level error from the browser control service (service is reachable
-// but returned an error response). Must NOT be wrapped with "Can't reach ..." messaging.
-class BrowserServiceError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "BrowserServiceError";
+class BrowserControlHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(`${status}: ${message}`);
+    this.name = "BrowserControlHttpError";
+    this.status = status;
+  }
+}
+
+class BrowserControlTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Browser request timed out after ${timeoutMs}ms`);
+    this.name = "BrowserControlTimeoutError";
+    this.timeoutMs = timeoutMs;
   }
 }
 
@@ -98,6 +109,24 @@ function withLoopbackBrowserAuth(
   });
 }
 
+function isBrowserTimeoutError(err: unknown): err is BrowserControlTimeoutError {
+  if (err instanceof BrowserControlTimeoutError) {
+    return true;
+  }
+  const msgLower = String(err).toLowerCase();
+  return (
+    msgLower.includes("timed out") ||
+    msgLower.includes("timeout") ||
+    msgLower.includes("aborted") ||
+    msgLower.includes("abort") ||
+    msgLower.includes("aborterror")
+  );
+}
+
+function getSuggestedRetryTimeoutMs(timeoutMs: number): number {
+  return Math.max(10_000, Math.min(120_000, timeoutMs * 3));
+}
+
 const BROWSER_TOOL_MODEL_HINT =
   "Do NOT retry the browser tool — it will keep failing. " +
   "Use an alternative approach or inform the user that the browser is currently unavailable.";
@@ -169,22 +198,16 @@ function enhanceDispatcherPathError(url: string, err: unknown): Error {
 }
 
 function enhanceBrowserFetchError(url: string, err: unknown, timeoutMs: number): Error {
-  const operatorHint = resolveBrowserFetchOperatorHint(url);
-  const msg = String(err);
-  const msgLower = msg.toLowerCase();
-  const looksLikeTimeout =
-    msgLower.includes("timed out") ||
-    msgLower.includes("timeout") ||
-    msgLower.includes("aborted") ||
-    msgLower.includes("abort") ||
-    msgLower.includes("aborterror");
-  if (looksLikeTimeout) {
+  if (isBrowserTimeoutError(err)) {
+    const suggestedTimeoutMs = getSuggestedRetryTimeoutMs(timeoutMs);
     return new Error(
-      appendBrowserToolModelHint(
-        `Can't reach the OpenClaw browser control service (timed out after ${timeoutMs}ms). ${operatorHint}`,
-      ),
+      `Browser request timed out after ${timeoutMs}ms. ` +
+        `The browser service may still be healthy. ` +
+        `Retry once with a higher timeoutMs (for example ${suggestedTimeoutMs}ms).`,
     );
   }
+  const operatorHint = resolveBrowserFetchOperatorHint(url);
+  const msg = String(err);
   return new Error(
     appendBrowserToolModelHint(
       `Can't reach the OpenClaw browser control service. ${operatorHint} (${msg})`,
@@ -198,6 +221,7 @@ async function fetchHttpJson<T>(
 ): Promise<T> {
   const timeoutMs = init.timeoutMs ?? 5000;
   const ctrl = new AbortController();
+  const timeoutReason = new BrowserControlTimeoutError(timeoutMs);
   const upstreamSignal = init.signal;
   let upstreamAbortListener: (() => void) | undefined;
   if (upstreamSignal) {
@@ -209,7 +233,7 @@ async function fetchHttpJson<T>(
     }
   }
 
-  const t = setTimeout(() => ctrl.abort(new Error("timed out")), timeoutMs);
+  const t = setTimeout(() => ctrl.abort(timeoutReason), timeoutMs);
   try {
     const res = await fetch(url, { ...init, signal: ctrl.signal });
     if (!res.ok) {
@@ -221,9 +245,14 @@ async function fetchHttpJson<T>(
         );
       }
       const text = await res.text().catch(() => "");
-      throw new BrowserServiceError(text || `HTTP ${res.status}`);
+      throw new BrowserControlHttpError(res.status, text || `HTTP ${res.status}`);
     }
     return (await res.json()) as T;
+  } catch (err) {
+    if (ctrl.signal.aborted && ctrl.signal.reason === timeoutReason) {
+      throw timeoutReason;
+    }
+    throw err;
   } finally {
     clearTimeout(t);
     if (upstreamSignal && upstreamAbortListener) {
@@ -238,6 +267,7 @@ export async function fetchBrowserJson<T>(
 ): Promise<T> {
   const timeoutMs = init?.timeoutMs ?? 5000;
   let isDispatcherPath = false;
+  const timeoutReason = new BrowserControlTimeoutError(timeoutMs);
   try {
     if (isAbsoluteHttp(url)) {
       const httpInit = withLoopbackBrowserAuth(url, init);
@@ -285,7 +315,7 @@ export async function fetchBrowserJson<T>(
 
     let timer: ReturnType<typeof setTimeout> | undefined;
     if (timeoutMs) {
-      timer = setTimeout(() => abortCtrl.abort(new Error("timed out")), timeoutMs);
+      timer = setTimeout(() => abortCtrl.abort(timeoutReason), timeoutMs);
     }
 
     const dispatchPromise = dispatcher.dispatch({
@@ -324,11 +354,11 @@ export async function fetchBrowserJson<T>(
         result.body && typeof result.body === "object" && "error" in result.body
           ? String((result.body as { error?: unknown }).error)
           : `HTTP ${result.status}`;
-      throw new BrowserServiceError(message);
+      throw new BrowserControlHttpError(result.status, message);
     }
     return result.body as T;
   } catch (err) {
-    if (err instanceof BrowserServiceError) {
+    if (err instanceof BrowserControlHttpError) {
       throw err;
     }
     // Dispatcher-path failures are service-operation failures, not network

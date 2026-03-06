@@ -54,6 +54,54 @@ function formatTabsToolResult(tabs: unknown[]): AgentToolResult<unknown> {
   };
 }
 
+const LOW_TIMEOUT_RETRY_THRESHOLD_MS = 5_000;
+const READ_RETRY_MIN_TIMEOUT_MS = 10_000;
+const READ_RETRY_TIMEOUT_MULTIPLIER = 3;
+
+function normalizeTimeoutMs(timeoutMs: number): number {
+  return Math.max(1000, Math.min(120_000, Math.floor(timeoutMs)));
+}
+
+function parseTimeoutMsFromError(error: unknown): number | null {
+  const match = String(error).match(/timed out after\s+(\d+)\s*ms/i);
+  if (!match) {
+    return null;
+  }
+  const parsed = Number.parseInt(match[1] ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return normalizeTimeoutMs(parsed);
+}
+
+function resolveReadRetryTimeoutMs(
+  initialTimeoutMs: number | undefined,
+  error: unknown,
+): number | null {
+  const timeoutMs = initialTimeoutMs ?? parseTimeoutMsFromError(error);
+  if (timeoutMs == null || timeoutMs > LOW_TIMEOUT_RETRY_THRESHOLD_MS) {
+    return null;
+  }
+  return normalizeTimeoutMs(
+    Math.max(READ_RETRY_MIN_TIMEOUT_MS, timeoutMs * READ_RETRY_TIMEOUT_MULTIPLIER),
+  );
+}
+
+async function runWithReadTimeoutRetry<T>(params: {
+  timeoutMs?: number;
+  run: (timeoutMs?: number) => Promise<T>;
+}): Promise<T> {
+  try {
+    return await params.run(params.timeoutMs);
+  } catch (error) {
+    const retryTimeoutMs = resolveReadRetryTimeoutMs(params.timeoutMs, error);
+    if (retryTimeoutMs === null) {
+      throw error;
+    }
+    return await params.run(retryTimeoutMs);
+  }
+}
+
 function formatConsoleToolResult(result: {
   targetId?: string;
   messages?: unknown[];
@@ -105,21 +153,31 @@ function canRetryChromeActWithoutTargetId(request: Parameters<typeof browserAct>
 }
 
 export async function executeTabsAction(params: {
+  input?: Record<string, unknown>;
   baseUrl?: string;
   profile?: string;
   proxyRequest: BrowserProxyRequest | null;
 }): Promise<AgentToolResult<unknown>> {
-  const { baseUrl, profile, proxyRequest } = params;
-  if (proxyRequest) {
-    const result = await proxyRequest({
-      method: "GET",
-      path: "/tabs",
-      profile,
-    });
-    const tabs = (result as { tabs?: unknown[] }).tabs ?? [];
-    return formatTabsToolResult(tabs);
-  }
-  const tabs = await browserTabs(baseUrl, { profile });
+  const { input, baseUrl, profile, proxyRequest } = params;
+  const timeoutMs =
+    typeof input?.timeoutMs === "number" && Number.isFinite(input.timeoutMs)
+      ? normalizeTimeoutMs(input.timeoutMs)
+      : undefined;
+  const tabs = await runWithReadTimeoutRetry({
+    timeoutMs,
+    run: async (effectiveTimeoutMs) => {
+      if (proxyRequest) {
+        const result = await proxyRequest({
+          method: "GET",
+          path: "/tabs",
+          profile,
+          timeoutMs: effectiveTimeoutMs,
+        });
+        return (result as { tabs?: unknown[] }).tabs ?? [];
+      }
+      return await browserTabs(baseUrl, { profile, timeoutMs: effectiveTimeoutMs });
+    },
+  });
   return formatTabsToolResult(tabs);
 }
 
@@ -158,6 +216,10 @@ export async function executeSnapshotAction(params: {
     typeof input.depth === "number" && Number.isFinite(input.depth) ? input.depth : undefined;
   const selector = typeof input.selector === "string" ? input.selector.trim() : undefined;
   const frame = typeof input.frame === "string" ? input.frame.trim() : undefined;
+  const timeoutMs =
+    typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs)
+      ? normalizeTimeoutMs(input.timeoutMs)
+      : undefined;
   const resolvedMaxChars =
     format === "ai"
       ? hasMaxChars
@@ -182,17 +244,23 @@ export async function executeSnapshotAction(params: {
     labels,
     mode,
   };
-  const snapshot = proxyRequest
-    ? ((await proxyRequest({
-        method: "GET",
-        path: "/snapshot",
-        profile,
-        query: snapshotQuery,
-      })) as Awaited<ReturnType<typeof browserSnapshot>>)
-    : await browserSnapshot(baseUrl, {
-        ...snapshotQuery,
-        profile,
-      });
+  const snapshot = await runWithReadTimeoutRetry({
+    timeoutMs,
+    run: async (effectiveTimeoutMs) =>
+      proxyRequest
+        ? ((await proxyRequest({
+            method: "GET",
+            path: "/snapshot",
+            profile,
+            timeoutMs: effectiveTimeoutMs,
+            query: snapshotQuery,
+          })) as Awaited<ReturnType<typeof browserSnapshot>>)
+        : await browserSnapshot(baseUrl, {
+            ...snapshotQuery,
+            profile,
+            timeoutMs: effectiveTimeoutMs,
+          }),
+  });
   if (snapshot.format === "ai") {
     const extractedText = snapshot.snapshot ?? "";
     const wrappedSnapshot = wrapExternalContent(extractedText, {
@@ -267,19 +335,33 @@ export async function executeConsoleAction(params: {
   const { input, baseUrl, profile, proxyRequest } = params;
   const level = typeof input.level === "string" ? input.level.trim() : undefined;
   const targetId = typeof input.targetId === "string" ? input.targetId.trim() : undefined;
-  if (proxyRequest) {
-    const result = (await proxyRequest({
-      method: "GET",
-      path: "/console",
-      profile,
-      query: {
+  const timeoutMs =
+    typeof input.timeoutMs === "number" && Number.isFinite(input.timeoutMs)
+      ? normalizeTimeoutMs(input.timeoutMs)
+      : undefined;
+  const result = await runWithReadTimeoutRetry({
+    timeoutMs,
+    run: async (effectiveTimeoutMs) => {
+      if (proxyRequest) {
+        return (await proxyRequest({
+          method: "GET",
+          path: "/console",
+          profile,
+          timeoutMs: effectiveTimeoutMs,
+          query: {
+            level,
+            targetId,
+          },
+        })) as { ok?: boolean; targetId?: string; messages?: unknown[] };
+      }
+      return await browserConsoleMessages(baseUrl, {
         level,
         targetId,
-      },
-    })) as { ok?: boolean; targetId?: string; messages?: unknown[] };
-    return formatConsoleToolResult(result);
-  }
-  const result = await browserConsoleMessages(baseUrl, { level, targetId, profile });
+        profile,
+        timeoutMs: effectiveTimeoutMs,
+      });
+    },
+  });
   return formatConsoleToolResult(result);
 }
 
@@ -290,16 +372,22 @@ export async function executeActAction(params: {
   proxyRequest: BrowserProxyRequest | null;
 }): Promise<AgentToolResult<unknown>> {
   const { request, baseUrl, profile, proxyRequest } = params;
+  const timeoutMs =
+    typeof request.timeoutMs === "number" && Number.isFinite(request.timeoutMs)
+      ? normalizeTimeoutMs(request.timeoutMs)
+      : undefined;
   try {
     const result = proxyRequest
       ? await proxyRequest({
           method: "POST",
           path: "/act",
           profile,
+          timeoutMs,
           body: request,
         })
       : await browserAct(baseUrl, request, {
           profile,
+          timeoutMs,
         });
     return jsonResult(result);
   } catch (err) {
@@ -323,10 +411,12 @@ export async function executeActAction(params: {
                 method: "POST",
                 path: "/act",
                 profile,
+                timeoutMs,
                 body: retryRequest,
               })
             : await browserAct(baseUrl, retryRequest, {
                 profile,
+                timeoutMs,
               });
           return jsonResult(retryResult);
         } catch {
