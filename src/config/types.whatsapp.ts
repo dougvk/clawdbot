@@ -87,6 +87,12 @@ type WhatsAppConfigCore = {
   markdown?: MarkdownConfig;
   /** Allow channel-initiated config writes (default: true). */
   configWrites?: boolean;
+  /**
+   * Outbound disappearing message expiration in seconds.
+   *
+   * For account entries (`channels.whatsapp.accounts.<id>`), this acts as an override of the channel-level value.
+   */
+  disappearingMessagesSeconds?: number;
   /** Send read receipts for incoming messages (default true). */
   sendReadReceipts?: boolean;
   /** Inbound message prefix override (WhatsApp only). */
