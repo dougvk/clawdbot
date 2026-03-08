@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
 import { normalizeAgentId } from "../../routing/session-key.js";
 import { parseAbsoluteTimeMs } from "../parse.js";
-import { computeNextRunAtMs } from "../schedule.js";
+import {
+  coerceFiniteScheduleNumber,
+  computeNextRunAtMs,
+  computePreviousRunAtMs,
+} from "../schedule.js";
 import {
   normalizeCronStaggerMs,
   resolveCronStaggerMs,
@@ -85,13 +89,39 @@ function isFiniteTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function computeStaggeredCronPreviousRunAtMs(job: CronJob, nowMs: number) {
+  if (job.schedule.kind !== "cron") {
+    return undefined;
+  }
+
+  const staggerMs = resolveCronStaggerMs(job.schedule);
+  const offsetMs = resolveStableCronOffsetMs(job.id, staggerMs);
+  if (offsetMs <= 0) {
+    return computePreviousRunAtMs(job.schedule, nowMs);
+  }
+
+  let cursorMs = Math.max(0, nowMs - offsetMs);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const basePrevious = computePreviousRunAtMs(job.schedule, cursorMs);
+    if (basePrevious === undefined) {
+      return undefined;
+    }
+    const shifted = basePrevious + offsetMs;
+    if (shifted <= nowMs) {
+      return shifted;
+    }
+    cursorMs = Math.max(0, basePrevious - 1_000);
+  }
+  return undefined;
+}
+
 function resolveEveryAnchorMs(params: {
   schedule: { everyMs: number; anchorMs?: number };
   fallbackAnchorMs: number;
 }) {
-  const raw = params.schedule.anchorMs;
-  if (isFiniteTimestamp(raw)) {
-    return Math.max(0, Math.floor(raw));
+  const coerced = coerceFiniteScheduleNumber(params.schedule.anchorMs);
+  if (coerced !== undefined) {
+    return Math.max(0, Math.floor(coerced));
   }
   if (isFiniteTimestamp(params.fallbackAnchorMs)) {
     return Math.max(0, Math.floor(params.fallbackAnchorMs));
@@ -202,7 +232,11 @@ export function computeJobNextRunAtMs(job: CronJob, nowMs: number): number | und
     return undefined;
   }
   if (job.schedule.kind === "every") {
-    const everyMs = Math.max(1, Math.floor(job.schedule.everyMs));
+    const everyMsRaw = coerceFiniteScheduleNumber(job.schedule.everyMs);
+    if (everyMsRaw === undefined) {
+      return undefined;
+    }
+    const everyMs = Math.max(1, Math.floor(everyMsRaw));
     const lastRunAtMs = job.state.lastRunAtMs;
     if (typeof lastRunAtMs === "number" && Number.isFinite(lastRunAtMs)) {
       const nextFromLastRun = Math.floor(lastRunAtMs) + everyMs;
@@ -247,6 +281,14 @@ export function computeJobNextRunAtMs(job: CronJob, nowMs: number): number | und
     return computeStaggeredCronNextRunAtMs(job, nextSecondMs);
   }
   return isFiniteTimestamp(next) ? next : undefined;
+}
+
+export function computeJobPreviousRunAtMs(job: CronJob, nowMs: number): number | undefined {
+  if (!job.enabled || job.schedule.kind !== "cron") {
+    return undefined;
+  }
+  const previous = computeStaggeredCronPreviousRunAtMs(job, nowMs);
+  return isFiniteTimestamp(previous) ? previous : undefined;
 }
 
 /** Maximum consecutive schedule errors before auto-disabling a job. */
@@ -339,21 +381,21 @@ function normalizeJobTickState(params: { state: CronServiceState; job: CronJob; 
 function walkSchedulableJobs(
   state: CronServiceState,
   fn: (params: { job: CronJob; nowMs: number }) => boolean,
+  nowMs = state.deps.nowMs(),
 ): boolean {
   if (!state.store) {
     return false;
   }
   let changed = false;
-  const now = state.deps.nowMs();
   for (const job of state.store.jobs) {
-    const tick = normalizeJobTickState({ state, job, nowMs: now });
+    const tick = normalizeJobTickState({ state, job, nowMs });
     if (tick.changed) {
       changed = true;
     }
     if (tick.skip) {
       continue;
     }
-    if (fn({ job, nowMs: now })) {
+    if (fn({ job, nowMs })) {
       changed = true;
     }
   }
@@ -405,19 +447,36 @@ export function recomputeNextRuns(state: CronServiceState): boolean {
  * to prevent silently advancing past-due nextRunAtMs values without execution
  * (see #13992).
  */
-export function recomputeNextRunsForMaintenance(state: CronServiceState): boolean {
-  return walkSchedulableJobs(state, ({ job, nowMs: now }) => {
-    let changed = false;
-    // Only compute missing nextRunAtMs, do NOT recompute existing ones.
-    // If a job was past-due but not found by findDueJobs, recomputing would
-    // cause it to be silently skipped.
-    if (!isFiniteTimestamp(job.state.nextRunAtMs)) {
-      if (recomputeJobNextRunAtMs({ state, job, nowMs: now })) {
-        changed = true;
+export function recomputeNextRunsForMaintenance(
+  state: CronServiceState,
+  opts?: { recomputeExpired?: boolean; nowMs?: number },
+): boolean {
+  const recomputeExpired = opts?.recomputeExpired ?? false;
+  return walkSchedulableJobs(
+    state,
+    ({ job, nowMs: now }) => {
+      let changed = false;
+      if (!isFiniteTimestamp(job.state.nextRunAtMs)) {
+        if (recomputeJobNextRunAtMs({ state, job, nowMs: now })) {
+          changed = true;
+        }
+      } else if (
+        recomputeExpired &&
+        now >= job.state.nextRunAtMs &&
+        typeof job.state.runningAtMs !== "number"
+      ) {
+        const lastRun = job.state.lastRunAtMs;
+        const alreadyExecutedSlot = isFiniteTimestamp(lastRun) && lastRun >= job.state.nextRunAtMs;
+        if (alreadyExecutedSlot) {
+          if (recomputeJobNextRunAtMs({ state, job, nowMs: now })) {
+            changed = true;
+          }
+        }
       }
-    }
-    return changed;
-  });
+      return changed;
+    },
+    opts?.nowMs,
+  );
 }
 
 export function nextWakeAtMs(state: CronServiceState) {
