@@ -388,10 +388,10 @@ describe("browser chrome helpers", () => {
     expect(proc.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
   });
 
-  it("includes headless flags when the selected profile is headless", () => {
+  it("includes headless flags when browser config is headless", () => {
     const args = buildOpenClawChromeLaunchArgs({
-      config: { noSandbox: false, extraArgs: [] },
-      profile: { cdpPort: 18800, headless: true },
+      config: { headless: true, noSandbox: false, extraArgs: [] },
+      profile: { cdpPort: 18800 },
       userDataDir: "/tmp/openclaw-profile",
       platform: "linux",
       display: ":1",
@@ -402,10 +402,10 @@ describe("browser chrome helpers", () => {
     expect(args).not.toContain("--ozone-platform=x11");
   });
 
-  it("uses headful flags on linux when the selected profile disables headless", () => {
+  it("uses headful flags on linux when browser config disables headless", () => {
     const args = buildOpenClawChromeLaunchArgs({
-      config: { noSandbox: false, extraArgs: [] },
-      profile: { cdpPort: 18800, headless: false },
+      config: { headless: false, noSandbox: false, extraArgs: [] },
+      profile: { cdpPort: 18800 },
       userDataDir: "/tmp/openclaw-profile",
       platform: "linux",
       display: ":1",

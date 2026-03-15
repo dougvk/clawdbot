@@ -17,6 +17,7 @@ import {
   browserStop,
 } from "../../browser/client.js";
 import { resolveBrowserConfig, resolveProfile } from "../../browser/config.js";
+import { DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME } from "../../browser/constants.js";
 import { DEFAULT_UPLOAD_DIR, resolveExistingPathsWithinRoot } from "../../browser/paths.js";
 import { getBrowserProfileCapabilities } from "../../browser/profile-capabilities.js";
 import { applyBrowserProxyPaths, persistBrowserProxyFiles } from "../../browser/proxy-files.js";
@@ -127,6 +128,16 @@ type BrowserProxyResult = {
 
 const DEFAULT_BROWSER_PROXY_TIMEOUT_MS = 20_000;
 const BROWSER_PROXY_GATEWAY_TIMEOUT_SLACK_MS = 5_000;
+const PREFERRED_HEADLESS_PROFILE_NAME = "work";
+
+type BrowserProxyRequest = (opts: {
+  method: string;
+  path: string;
+  query?: Record<string, string | number | boolean | undefined>;
+  body?: unknown;
+  timeoutMs?: number;
+  profile?: string;
+}) => Promise<unknown>;
 
 type BrowserNodeTarget = {
   nodeId: string;
@@ -259,6 +270,77 @@ function applyProxyPaths(result: unknown, mapping: Map<string, string>) {
   applyBrowserProxyPaths(result, mapping);
 }
 
+async function resolveBrowserProfileForToolCall(params: {
+  requestedProfile?: string;
+  requestedHeadless?: boolean;
+  resolvedConfig: ReturnType<typeof resolveBrowserConfig>;
+  baseUrl?: string;
+  proxyRequest: BrowserProxyRequest | null;
+}): Promise<string> {
+  const requestedProfile = params.requestedProfile?.trim();
+  if (requestedProfile) {
+    return requestedProfile;
+  }
+
+  const defaultProfile =
+    params.resolvedConfig.defaultProfile?.trim() || DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME;
+  if (params.requestedHeadless !== true) {
+    return defaultProfile;
+  }
+
+  const candidateNames = new Set<string>([
+    PREFERRED_HEADLESS_PROFILE_NAME,
+    defaultProfile,
+    DEFAULT_OPENCLAW_BROWSER_PROFILE_NAME,
+    ...Object.keys(params.resolvedConfig.profiles),
+  ]);
+
+  try {
+    const profiles = params.proxyRequest
+      ? ((
+          (await params.proxyRequest({
+            method: "GET",
+            path: "/profiles",
+          })) as { profiles?: Array<{ name?: unknown }> }
+        ).profiles ?? [])
+      : await browserProfiles(params.baseUrl);
+    for (const entry of profiles) {
+      const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+      if (name) {
+        candidateNames.add(name);
+      }
+    }
+  } catch {
+    // Keep fallback candidates only.
+  }
+
+  const orderedCandidates = [
+    PREFERRED_HEADLESS_PROFILE_NAME,
+    ...Array.from(candidateNames).filter((name) => name !== PREFERRED_HEADLESS_PROFILE_NAME),
+  ];
+
+  for (const name of orderedCandidates) {
+    try {
+      const status = params.proxyRequest
+        ? ((await params.proxyRequest({
+            method: "GET",
+            path: "/",
+            profile: name,
+          })) as { headless?: unknown })
+        : await browserStatus(params.baseUrl, { profile: name });
+      if (status.headless === true) {
+        return name;
+      }
+    } catch {
+      // Ignore unavailable profiles while probing.
+    }
+  }
+
+  throw new Error(
+    'No headless browser profile is available. Pass profile="<name>" or configure browser.profiles.<name>.headless=true.',
+  );
+}
+
 function resolveBrowserBaseUrl(params: {
   target?: "sandbox" | "host";
   sandboxBridgeUrl?: string;
@@ -336,24 +418,27 @@ export function createBrowserTool(opts?: {
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
       const action = readStringParam(params, "action", { required: true });
-      const profile = readStringParam(params, "profile");
+      const cfg = loadConfig();
+      const resolvedBrowserConfig = resolveBrowserConfig(cfg.browser, cfg);
+      const requestedProfile = readStringParam(params, "profile");
+      const requestedHeadless = typeof params.headless === "boolean" ? params.headless : undefined;
       const requestedNode = readStringParam(params, "node");
       let target = readStringParam(params, "target") as "sandbox" | "host" | "node" | undefined;
 
       if (requestedNode && target && target !== "node") {
         throw new Error('node is only supported with target="node".');
       }
-      if (isHostOnlyProfileName(profile)) {
+      if (isHostOnlyProfileName(requestedProfile)) {
         if (requestedNode || target === "node") {
-          throw new Error(`profile="${profile}" only supports the local host browser.`);
+          throw new Error(`profile="${requestedProfile}" only supports the local host browser.`);
         }
         if (target === "sandbox") {
           throw new Error(
-            `profile="${profile}" cannot use the sandbox browser; use target="host" or omit target.`,
+            `profile="${requestedProfile}" cannot use the sandbox browser; use target="host" or omit target.`,
           );
         }
       }
-      if (!target && !requestedNode && shouldPreferHostForProfile(profile)) {
+      if (!target && !requestedNode && shouldPreferHostForProfile(requestedProfile)) {
         // Local host user-browser profiles should not silently bind to sandbox/node browsers.
         target = "host";
       }
@@ -373,15 +458,8 @@ export function createBrowserTool(opts?: {
             allowHostControl: opts?.allowHostControl,
           });
 
-      const proxyRequest = nodeTarget
-        ? async (opts: {
-            method: string;
-            path: string;
-            query?: Record<string, string | number | boolean | undefined>;
-            body?: unknown;
-            timeoutMs?: number;
-            profile?: string;
-          }) => {
+      const proxyRequest: BrowserProxyRequest | null = nodeTarget
+        ? async (opts) => {
             const proxy = await callBrowserProxy({
               nodeId: nodeTarget.nodeId,
               method: opts.method,
@@ -396,6 +474,13 @@ export function createBrowserTool(opts?: {
             return proxy.result;
           }
         : null;
+      const profile = await resolveBrowserProfileForToolCall({
+        requestedProfile: requestedProfile ?? undefined,
+        requestedHeadless,
+        resolvedConfig: resolvedBrowserConfig,
+        baseUrl,
+        proxyRequest,
+      });
 
       switch (action) {
         case "status":

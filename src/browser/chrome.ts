@@ -67,8 +67,8 @@ export type RunningChrome = {
   proc: ChildProcessWithoutNullStreams;
 };
 
-type LaunchArgsConfig = Pick<ResolvedBrowserConfig, "noSandbox" | "extraArgs">;
-type LaunchArgsProfile = Pick<ResolvedBrowserProfile, "cdpPort" | "headless">;
+type LaunchArgsConfig = Pick<ResolvedBrowserConfig, "headless" | "noSandbox" | "extraArgs">;
+type LaunchArgsProfile = Pick<ResolvedBrowserProfile, "cdpPort">;
 
 function resolveBrowserExecutable(resolved: ResolvedBrowserConfig): BrowserExecutable | null {
   return resolveBrowserExecutableForPlatform(resolved, process.platform);
@@ -274,7 +274,7 @@ export function buildOpenClawChromeLaunchArgs(params: {
     "--password-store=basic",
   ];
 
-  if (profile.headless) {
+  if (config.headless) {
     // Best-effort; older Chromes may ignore.
     args.push("--headless=new");
     args.push("--disable-gpu");
@@ -294,7 +294,7 @@ export function buildOpenClawChromeLaunchArgs(params: {
     // (often via distro wrappers that append --ozone-platform=wayland). We've
     // observed CDP Page.captureScreenshot hanging indefinitely in that mode.
     // If X11 is available, prefer it for the managed OpenClaw browser.
-    if (!profile.headless && display?.trim()) {
+    if (!config.headless && display?.trim()) {
       args.push("--ozone-platform=x11");
       args.push("--ozone-platform-hint=x11");
     }

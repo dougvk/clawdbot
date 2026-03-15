@@ -9,6 +9,15 @@ import {
 } from "./control-service.js";
 import { createBrowserRouteDispatcher } from "./routes/dispatcher.js";
 
+// Application-level error from the browser control service (service is reachable
+// but returned an error response). Must NOT be wrapped with "Can't reach ..." messaging.
+class BrowserServiceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BrowserServiceError";
+  }
+}
+
 class BrowserControlHttpError extends Error {
   readonly status: number;
 
@@ -358,7 +367,7 @@ export async function fetchBrowserJson<T>(
     }
     return result.body as T;
   } catch (err) {
-    if (err instanceof BrowserControlHttpError) {
+    if (err instanceof BrowserControlHttpError || err instanceof BrowserServiceError) {
       throw err;
     }
     // Dispatcher-path failures are service-operation failures, not network

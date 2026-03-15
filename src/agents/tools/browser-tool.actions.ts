@@ -152,6 +152,11 @@ function canRetryChromeActWithoutTargetId(request: Parameters<typeof browserAct>
   return kind === "hover" || kind === "scrollIntoView" || kind === "wait";
 }
 
+function isStaleElementError(err: unknown): boolean {
+  const msg = String(err).toLowerCase();
+  return msg.includes("element") && (msg.includes("not found") || msg.includes("not visible"));
+}
+
 export async function executeTabsAction(params: {
   input?: Record<string, unknown>;
   baseUrl?: string;
@@ -373,7 +378,9 @@ export async function executeActAction(params: {
 }): Promise<AgentToolResult<unknown>> {
   const { request, baseUrl, profile, proxyRequest } = params;
   const timeoutMs =
-    typeof request.timeoutMs === "number" && Number.isFinite(request.timeoutMs)
+    "timeoutMs" in request &&
+    typeof request.timeoutMs === "number" &&
+    Number.isFinite(request.timeoutMs)
       ? normalizeTimeoutMs(request.timeoutMs)
       : undefined;
   try {
@@ -391,6 +398,12 @@ export async function executeActAction(params: {
         });
     return jsonResult(result);
   } catch (err) {
+    if (isStaleElementError(err)) {
+      throw new Error(
+        'Browser element reference is stale. Run action="snapshot" again on the same tab, then retry using a fresh ref/element id.',
+        { cause: err },
+      );
+    }
     if (isChromeStaleTargetError(profile, err)) {
       const retryRequest = stripTargetIdFromActRequest(request);
       const tabs = proxyRequest
